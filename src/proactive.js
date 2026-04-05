@@ -149,6 +149,72 @@ function computeNextFixedWakePlan(nowMs = Date.now()) {
   };
 }
 
+function parseBeijingDateTimeToMs(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return null;
+  const m = raw.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})$/);
+  if (!m) return null;
+  const yyyy = Number(m[1]);
+  const mm = Number(m[2]);
+  const dd = Number(m[3]);
+  const hh = Number(m[4]);
+  const mi = Number(m[5]);
+  if (!Number.isFinite(yyyy) || !Number.isFinite(mm) || !Number.isFinite(dd)) return null;
+  if (!Number.isFinite(hh) || !Number.isFinite(mi)) return null;
+  return Date.parse(
+    `${String(yyyy).padStart(4, "0")}-${String(mm).padStart(2, "0")}-${String(dd).padStart(
+      2,
+      "0"
+    )}T${String(hh).padStart(2, "0")}:${String(mi).padStart(2, "0")}:00+08:00`
+  );
+}
+
+function computeNextBurstWakePlan(nowMs = Date.now()) {
+  const startText = String(
+    process.env.PROACTIVE_BURST_START_BEIJING || "2026-04-06 07:36"
+  ).trim();
+  const startMs = parseBeijingDateTimeToMs(startText);
+  if (!Number.isFinite(startMs)) {
+    const fallbackDelay = minutesToMs(180);
+    return {
+      active: false,
+      delayMs: fallbackDelay,
+      targetTimeLabel: formatBeijingFromMs(nowMs + fallbackDelay),
+      mode: "burst_invalid_start_fallback",
+      reason: "invalid_start",
+    };
+  }
+
+  const intervalMin = Math.max(
+    1,
+    Number(process.env.PROACTIVE_BURST_INTERVAL_MINUTES || 6) || 6
+  );
+  const totalTimes = Math.max(1, Number(process.env.PROACTIVE_BURST_TIMES || 9) || 9);
+  const stepMs = minutesToMs(intervalMin);
+
+  for (let i = 0; i < totalTimes; i += 1) {
+    const ts = startMs + i * stepMs;
+    if (ts > nowMs + 1000) {
+      return {
+        active: true,
+        delayMs: Math.max(1000, ts - nowMs),
+        targetTimeLabel: formatBeijingFromMs(ts),
+        mode: "burst",
+        index: i + 1,
+        total: totalTimes,
+      };
+    }
+  }
+
+  return {
+    active: false,
+    delayMs: null,
+    targetTimeLabel: null,
+    mode: "burst_done",
+    reason: "all_slots_passed",
+  };
+}
+
 function shouldSkipByHardRules({ nowMs, lastProactiveMs, lastUserMs }) {
   // Temporary default: disabled unless explicitly turned back on.
   const disableHardRules = parseBool(process.env.PROACTIVE_DISABLE_HARD_RULES, true);
@@ -441,15 +507,30 @@ function startProactiveScheduler() {
     .trim()
     .toLowerCase();
   const loop = () => {
-    const useFixed = scheduleMode !== "random";
-    const plan = useFixed ? computeNextFixedWakePlan(Date.now()) : null;
-    const delay = useFixed ? plan.delayMs : computeNextIntervalMs();
-    const minutes = (delay / 60000).toFixed(1);
-    if (useFixed) {
-      console.log(`[proactive] next fixed wake at ${plan.targetTimeLabel} (in ${minutes} min)`);
+    const nowMs = Date.now();
+    let delay;
+    let label = "";
+    if (scheduleMode === "random") {
+      delay = computeNextIntervalMs();
+      label = `[proactive] next wake in ${(delay / 60000).toFixed(1)} min`;
+    } else if (scheduleMode === "burst") {
+      const plan = computeNextBurstWakePlan(nowMs);
+      if (!plan.active) {
+        console.log(`[proactive] burst schedule finished (${plan.reason || "done"})`);
+        return;
+      }
+      delay = plan.delayMs;
+      label = `[proactive] next burst wake ${plan.index}/${plan.total} at ${plan.targetTimeLabel} (in ${(
+        delay / 60000
+      ).toFixed(1)} min)`;
     } else {
-      console.log(`[proactive] next wake in ${minutes} min`);
+      const plan = computeNextFixedWakePlan(nowMs);
+      delay = plan.delayMs;
+      label = `[proactive] next fixed wake at ${plan.targetTimeLabel} (in ${(delay / 60000).toFixed(
+        1
+      )} min)`;
     }
+    console.log(label);
 
     setTimeout(async () => {
       try {
