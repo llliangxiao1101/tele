@@ -25,6 +25,18 @@ const APP_MEMORY_USER_KEY_HASH = String(
 const HAS_EXPLICIT_MEMORY_KEY = Boolean(
   String(process.env.APP_MEMORY_USER_KEY_HASH || process.env.TG_MEMORY_USER_KEY_HASH || "").trim()
 );
+const INSERT_RETRY_INTERVAL_MS = Math.max(
+  1000,
+  Number(process.env.MESSAGE_INSERT_RETRY_INTERVAL_MS || 60000) || 60000
+);
+const INSERT_RETRY_MAX_QUEUE = Math.max(
+  10,
+  Number(process.env.MESSAGE_INSERT_RETRY_MAX_QUEUE || 1000) || 1000
+);
+
+const pendingInsertQueue = [];
+let insertRetryWorkerStarted = false;
+let insertRetryTickRunning = false;
 
 function normalizeConversationId(value, fallback = APP_CHAT_CONVERSATION_ID || "main") {
   const raw = typeof value === "string" ? value.trim() : String(value ?? "").trim();
@@ -139,7 +151,7 @@ function normalizeMemoryLine(row, index) {
   return `${head}${tsPart} {${safeTitle}}: ${oneLineContent}${anchorPart}`;
 }
 
-async function insertMessage(event) {
+async function insertMessageNow(event) {
   const userKeyHash = String(event?.user_key_hash || APP_CHAT_USER_KEY_HASH).trim() || APP_CHAT_USER_KEY_HASH;
   const conversationId = normalizeConversationId(event?.conversation_id, APP_CHAT_CONVERSATION_ID);
   const row = {
@@ -159,6 +171,85 @@ async function insertMessage(event) {
     throw new Error(`insertMessage failed: ${error.message}`);
   }
   return mapRowToEvent(data);
+}
+
+function enqueueInsertRetry(event, reason = "") {
+  if (pendingInsertQueue.length >= INSERT_RETRY_MAX_QUEUE) {
+    const dropped = pendingInsertQueue.shift();
+    console.warn(
+      `[insert-retry] queue full (${INSERT_RETRY_MAX_QUEUE}), dropped oldest event role=${dropped?.event?.role || "unknown"}`
+    );
+  }
+  pendingInsertQueue.push({
+    event,
+    attempts: 1,
+    lastError: String(reason || "").trim(),
+    enqueuedAt: Date.now(),
+    nextRetryAt: Date.now() + INSERT_RETRY_INTERVAL_MS,
+  });
+  console.warn(
+    `[insert-retry] queued event role=${event?.role || "unknown"} platform=${event?.platform || "unknown"} size=${pendingInsertQueue.length}`
+  );
+}
+
+async function runInsertRetryTick() {
+  if (insertRetryTickRunning) return;
+  insertRetryTickRunning = true;
+  try {
+    if (!pendingInsertQueue.length) return;
+
+    const now = Date.now();
+    let cursor = 0;
+    while (cursor < pendingInsertQueue.length) {
+      const item = pendingInsertQueue[cursor];
+      if (!item || now < Number(item.nextRetryAt || 0)) {
+        cursor += 1;
+        continue;
+      }
+      try {
+        await insertMessageNow(item.event);
+        pendingInsertQueue.splice(cursor, 1);
+        console.log(
+          `[insert-retry] success role=${item?.event?.role || "unknown"} remaining=${pendingInsertQueue.length}`
+        );
+      } catch (err) {
+        item.attempts = Number(item.attempts || 0) + 1;
+        item.lastError = err?.message || String(err);
+        item.nextRetryAt = Date.now() + INSERT_RETRY_INTERVAL_MS;
+        cursor += 1;
+        console.warn(
+          `[insert-retry] failed attempt=${item.attempts} role=${item?.event?.role || "unknown"} err=${item.lastError}`
+        );
+      }
+    }
+  } finally {
+    insertRetryTickRunning = false;
+  }
+}
+
+function startInsertRetryWorker() {
+  if (insertRetryWorkerStarted) return;
+  insertRetryWorkerStarted = true;
+  console.log(`[insert-retry] started interval=${INSERT_RETRY_INTERVAL_MS}ms`);
+  setInterval(() => {
+    runInsertRetryTick().catch((err) => {
+      console.error("[insert-retry] tick fatal:", err?.message || err);
+    });
+  }, INSERT_RETRY_INTERVAL_MS);
+}
+
+async function insertMessageWithRetry(event) {
+  try {
+    return await insertMessageNow(event);
+  } catch (err) {
+    startInsertRetryWorker();
+    enqueueInsertRetry(event, err?.message || String(err));
+    return null;
+  }
+}
+
+async function insertMessage(event) {
+  return insertMessageWithRetry(event);
 }
 
 async function queryRecentEvents({ limit = 100, chatId = null, conversationId = null, userKeyHash = null } = {}) {
@@ -389,6 +480,7 @@ module.exports = {
   kvGet,
   kvSet,
   insertMessage,
+  insertMessageWithRetry,
   insertEvent: insertMessage,
   queryRecentEvents,
   queryConversationOptions,
@@ -396,4 +488,5 @@ module.exports = {
   querySavedMemoriesForPrompt,
   normalizeConversationId,
   ensureDefaultKv,
+  startInsertRetryWorker,
 };
