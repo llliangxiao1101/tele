@@ -53,6 +53,14 @@ function makePollerOwnerId() {
   return `poller:${host}:${process.pid}`;
 }
 
+function lockScopeFromToken(token, fallback = "default") {
+  const raw = String(token || "").trim();
+  if (!raw) return fallback;
+  const botId = raw.split(":")[0];
+  if (/^\d+$/.test(botId)) return botId;
+  return fallback;
+}
+
 async function tryAcquirePollerLock({ lockKey, ownerId, leaseMs }) {
   const nowMs = Date.now();
   const current = await kvGet(lockKey, null);
@@ -384,7 +392,8 @@ async function startTelegramPoller() {
   if (!Number.isInteger(offset)) offset = undefined;
 
   const lockEnabled = parseBool(process.env.TG_POLLER_LOCK_ENABLED, true);
-  const lockKey = `tg_poller_lock_${chatId}`;
+  const lockScope = lockScopeFromToken(cfg.token, chatId || "default");
+  const lockKey = `tg_poller_lock_bot_${lockScope}`;
   const ownerId = makePollerOwnerId();
   const lockLeaseMs = Math.max(
     (Number(cfg.pollingTimeoutSec) || 20) * 1000 + 10000,
@@ -450,12 +459,19 @@ async function startTelegramPoller() {
       }
     } catch (err) {
       if (Number(err?.response?.status) === 409) {
+        const desc = String(err?.response?.data?.description || "").trim();
         hasLeaderLock = false;
+        if (desc) {
+          console.warn(`[poller] 409 conflict detected: ${desc}`);
+        }
         console.warn("[poller] 409 conflict detected, will retry with lock backoff");
         await sleep(5000);
         continue;
       }
-      console.error("[poller] loop error:", err.message || err);
+      const detail = err?.response?.data
+        ? JSON.stringify(err.response.data)
+        : (err.message || err);
+      console.error("[poller] loop error:", detail);
       await sleep(3000);
     }
   }
