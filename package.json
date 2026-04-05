@@ -1,0 +1,17 @@
+{
+  "name": "dual-platform-dialog-server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "check": "node --check src/index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.50.5",
+    "axios": "^1.8.4",
+    "dotenv": "^17.3.1",
+    "express": "^5.1.0"
+  }
+}
