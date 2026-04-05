@@ -46,6 +46,12 @@ function parseBool(v, fallback = false) {
   return fallback;
 }
 
+function parseNonNegativeNumber(v, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(0, n);
+}
+
 // Keep random scheduler logic for later rollback.
 function computeNextIntervalMs() {
   const wakesPerDay = Number(process.env.PROACTIVE_WAKES_PER_DAY || 0);
@@ -133,21 +139,31 @@ function computeNextFixedWakePlan(nowMs = Date.now()) {
 }
 
 function shouldSkipByHardRules({ nowMs, lastProactiveMs, lastUserMs }) {
-  const cooldownMin = Math.max(1, Number(process.env.PROACTIVE_COOLDOWN_MINUTES || 30) || 30);
-  const recentUserMin = Math.max(
-    1,
-    Number(process.env.PROACTIVE_SKIP_IF_USER_ACTIVE_WITHIN_MINUTES || 30) || 30
+  // Temporary default: disabled unless explicitly turned back on.
+  const disableHardRules = parseBool(process.env.PROACTIVE_DISABLE_HARD_RULES, true);
+  if (disableHardRules) {
+    return { skip: false, reason: "hard_rules_disabled" };
+  }
+
+  const cooldownMin = parseNonNegativeNumber(process.env.PROACTIVE_COOLDOWN_MINUTES, 30);
+  const recentUserMin = parseNonNegativeNumber(
+    process.env.PROACTIVE_SKIP_IF_USER_ACTIVE_WITHIN_MINUTES,
+    30
   );
-  if (lastProactiveMs && nowMs - lastProactiveMs < minutesToMs(cooldownMin)) {
+  if (cooldownMin > 0 && lastProactiveMs && nowMs - lastProactiveMs < minutesToMs(cooldownMin)) {
     return { skip: true, reason: `cooldown<${cooldownMin}m` };
   }
-  if (lastUserMs && nowMs - lastUserMs < minutesToMs(recentUserMin)) {
+  if (recentUserMin > 0 && lastUserMs && nowMs - lastUserMs < minutesToMs(recentUserMin)) {
     return { skip: true, reason: `user_active_within_${recentUserMin}m` };
   }
   return { skip: false, reason: "pass" };
 }
 
 function shouldSkipByQuietHours(timeInfo) {
+  // Temporary default: disabled unless explicitly turned back on.
+  const disableQuietHours = parseBool(process.env.PROACTIVE_DISABLE_QUIET_HOURS, true);
+  if (disableQuietHours) return { skip: false, reason: "quiet_hours_disabled_by_env" };
+
   const startHour = Math.max(
     0,
     Math.min(Number(process.env.PROACTIVE_QUIET_START_HOUR || 1) || 1, 23)
@@ -425,4 +441,3 @@ function startProactiveScheduler() {
 module.exports = {
   startProactiveScheduler,
 };
-
